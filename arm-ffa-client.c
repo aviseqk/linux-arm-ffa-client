@@ -415,6 +415,51 @@ unregister:
 	return ret;
 }
 
+#define NOTIF_LINUX_TO_SP_ID		19U
+#define NOTIF_SP_TO_LINUX_ID		20U
+
+static void sp_notification_cb(int notify_id, void *cb_data)
+{
+	struct ffa_device *ffa_dev = cb_data;
+
+	dev_info(&ffa_dev->dev,
+			"[NOTIFICATION_CALLBACK]: Linux ran callback for notification %d\n", notify_id);
+	
+	if (notify_id != NOTIF_SP_TO_LINUX_ID)
+		return;
+}
+
+int bind_ffa_notification_for_test(struct ffa_device *ffa_dev)
+{
+	const struct ffa_notifier_ops *notifier_ops;
+	int ret;
+
+	if (!ffa_dev->ops || !ffa_dev->ops->msg_ops || !ffa_dev->ops->notifier_ops)
+		return -EOPNOTSUPP;
+
+	notifier_ops = ffa_dev->ops->notifier_ops;
+
+	ret = notifier_ops->notify_request(ffa_dev,
+			false, sp_notification_cb,
+			ffa_dev, NOTIF_SP_TO_LINUX_ID);
+
+	if (ret)
+		return ret;
+	return 0;
+}
+
+int notify_sp_test(struct ffa_device *ffa_dev)
+{
+	dev_info(&ffa_dev->dev, "notify_sp_test called()\n");
+	int ret;
+
+	ret = ffa_dev->ops->notifier_ops->notify_send(ffa_dev, NOTIF_LINUX_TO_SP_ID, false, 0);
+	if (ret)
+		dev_err(&ffa_dev->dev, "Failed to notify SP \n");
+	return ret;
+	dev_info(&ffa_dev->dev, "SP was notified with ID: %d\n", NOTIF_LINUX_TO_SP_ID);
+}
+
 static int ffa_ref_client_probe(struct ffa_device *ffa_dev)
 {
 	int ret;
@@ -469,6 +514,25 @@ static int ffa_ref_client_probe(struct ffa_device *ffa_dev)
 		return -EOPNOTSUPP;
 	}
 
+	// BUG: notification test from here REMOVE THIS FROM HERE
+	ret = bind_ffa_notification_for_test(ffa_dev);
+	if (ret) {
+		dev_err(&ffa_dev->dev, "Linux unable to bind the notification %d to the SP\n", NOTIF_SP_TO_LINUX_ID);
+		return ret;
+	} else {
+		dev_info(&ffa_dev->dev,
+				"Linux bound Notification %d to the SP properly, now ringing the notification\n", NOTIF_SP_TO_LINUX_ID);
+	}
+	
+	/* ringing the notification to the SP */
+	dev_info(&ffa_dev->dev, "[TEST]: Notification Ringing\n");
+	ret = notify_sp_test(ffa_dev);
+	if (ret)
+		dev_err(&ffa_dev->dev, "Unable to ring Notification %d to the SP\n", NOTIF_LINUX_TO_SP_ID);
+	else 
+		dev_info(&ffa_dev->dev, "Notification %d ringed to SP properly\n", NOTIF_LINUX_TO_SP_ID);
+
+
 	dev_info(&ffa_dev->dev, "[TEST3]: Indirect Messaging\n");
 	ret = ffa_indirect_msg_test(ffa_dev);
 	if (ret == -ETIMEDOUT) {
@@ -485,6 +549,7 @@ static int ffa_ref_client_probe(struct ffa_device *ffa_dev)
 	}
 
 	return 0;
+
 }
 
 static void ffa_ref_client_remove(struct ffa_device *ffa_dev)
