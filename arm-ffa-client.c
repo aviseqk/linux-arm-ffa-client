@@ -1,4 +1,5 @@
 #include <asm-generic/errno.h>
+#include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/arm_ffa.h>
 #include <linux/module.h>
@@ -7,6 +8,12 @@
 #include <linux/completion.h>
 #include <linux/jiffies.h>
 #include <linux/slab.h>
+#include <linux/types.h>
+#include <linux/wait.h>
+#include <linux/atomic.h>
+#include <linux/bitmap.h>
+#include <linux/device.h>
+#include <linux/delay.h>
 
 
 //#include "ffa_client_internal.h" 
@@ -416,52 +423,334 @@ unregister:
 }
 
 #define NOTIF_LINUX_TO_SP_ID		19U
-#define NOTIF_SP_TO_LINUX_ID		20U
+#define NOTIF_LINUX_TO_SP_ID		19U
+#define NOTIF_LINUX_REBIND_ID		25U
+#define NOTIF_LINUX_UNBOUND_ID		24U
 
+#define NOTIF_SP_TO_LINUX_ID		20U
+#define NOTIF_SP_TO_LINUX_MULTI_A_ID	21U
+#define NOTIF_SP_TO_LINUX_MULTI_B_ID	22U
+#define NOTIF_SP_REBIND_ACK_ID		23U
+
+#define FFA_REF_MAX_NOTIFICATIONS	64
+
+#define FFA_REF_NOTIFICATION_TIMEOUT	msecs_to_jiffies(5000)
+#define FFA_REF_NOTIFICATION_SETTLE	200
+
+#define NOTIF_SP_RESPONSE_MASK	\
+			(BIT_ULL(NOTIF_SP_TO_LINUX_ID) | \
+			 BIT_ULL(NOTIF_SP_TO_LINUX_MULTI_A_ID) | \
+			 BIT_ULL(NOTIF_SP_TO_LINUX_MULTI_B_ID))
+
+struct ffa_ref_notification_ctx {
+	struct ffa_device *ffa_dev;
+
+	DECLARE_BITMAP(registered, FFA_REF_MAX_NOTIFICATIONS);
+	DECLARE_BITMAP(received, FFA_REF_MAX_NOTIFICATIONS);
+	
+	/* this is a separate callback counter for each notification ID,
+	 * * allowing us to verify that repeated SETs calls for a pending 
+	 * * notification ID does not lead to duplicate callback delivery */
+	atomic_t callback_count[FFA_REF_MAX_NOTIFICATIONS];
+
+	wait_queue_head_t waitq;
+};
+
+/* Application Notification Callback */
 static void sp_notification_cb(int notify_id, void *cb_data)
 {
-	struct ffa_device *ffa_dev = cb_data;
+	struct ffa_ref_notification_ctx *ctx = cb_data;
 
-	dev_info(&ffa_dev->dev,
-			"[NOTIFICATION_CALLBACK]: Linux ran callback for notification %d\n", notify_id);
-	
-	if (notify_id != NOTIF_SP_TO_LINUX_ID)
+	if (notify_id >= FFA_REF_MAX_NOTIFICATIONS) {
+		dev_err(&ctx->ffa_dev->dev,
+				"Callback received for invalid notification ID: %d\n", notify_id);
 		return;
+	}
+
+	atomic_inc(&ctx->callback_count[notify_id]);
+
+	set_bit(notify_id, ctx->received);
+
+	wake_up_all(&ctx->waitq);
+
+	dev_info(&ctx->ffa_dev->dev,
+			"[NOTIFICATION_CALLBACK]: received ID: %d (count=%d)\n",
+			notify_id, atomic_read(&ctx->callback_count[notify_id]));
 }
 
-int bind_ffa_notification_for_test(struct ffa_device *ffa_dev)
+/* to bind SP as sender to a single notification ID and register the callback */
+static int ffa_ref_notification_register(struct ffa_ref_notification_ctx *ctx,
+		const struct ffa_notifier_ops *ops, int notify_id)
 {
-	const struct ffa_notifier_ops *notifier_ops;
 	int ret;
 
-	if (!ffa_dev->ops || !ffa_dev->ops->msg_ops || !ffa_dev->ops->notifier_ops)
+	ret = ops->notify_request(ctx->ffa_dev, false, sp_notification_cb, ctx, notify_id);
+	if (ret) {
+		dev_err(&ctx->ffa_dev->dev,
+				"notify_request for ID %d failed: %d\n", notify_id, ret);
+		return ret;
+	}
+
+	set_bit(notify_id, ctx->registered);
+	dev_info(&ctx->ffa_dev->dev,
+			"Registered callback and bound SP as sender for ID %d\n", notify_id);
+
+	return 0;
+}
+
+static void ffa_ref_notifications_count_zero(struct ffa_ref_notification_ctx *ctx)
+{
+	bitmap_zero(ctx->received, FFA_REF_MAX_NOTIFICATIONS);
+
+	for (unsigned int i = 0; i < FFA_REF_MAX_NOTIFICATIONS; i++) {
+		atomic_set(&ctx->callback_count[i], 0);
+	}
+}
+
+/* function to check whether all requested notification IDs have reached their callbacks
+ * NOTE: This is the condition check for the waitqueue, basically the event for test task on
+ * of the waitqueue is waiting on to be true, that all required notification IDs have been received */
+static bool ffa_ref_notification_mask_received(struct ffa_ref_notification_ctx *ctx, u64 mask)
+{
+	for (unsigned int i = 0; i < FFA_REF_MAX_NOTIFICATIONS; i++) {
+		if ((mask & BIT_ULL(i)) && 
+			!test_bit(i, ctx->received))
+			return false;
+	}
+	return true;
+}
+
+static int ffa_ref_wait_for_notifications(struct ffa_ref_notification_ctx *ctx, u64 mask)
+{
+	long waited;
+
+	waited = wait_event_timeout(ctx->waitq,
+			ffa_ref_notification_mask_received(ctx, mask),
+			FFA_REF_NOTIFICATION_TIMEOUT);
+
+	return waited ? 0 : -ETIMEDOUT;
+}
+
+/* to verify that each requested notification ID has caused just one callback invocation */
+static int ffa_ref_verify_single_delivery(struct ffa_ref_notification_ctx *ctx,
+		const unsigned int *ids, size_t count)
+{
+	msleep(FFA_REF_NOTIFICATION_SETTLE);
+
+	for(size_t i = 0; i < count; i++) {
+		int callbacks;
+
+		callbacks = atomic_read(&ctx->callback_count[ids[i]]);
+		if (callbacks != 1) {
+			dev_err(&ctx->ffa_dev->dev,
+					"Notification ID %d callback count %d expected 1\n",
+					ids[i], callbacks);
+			return -EPROTO;
+		}
+	}
+	return 0;
+}
+
+/* Cleanup Function - This function relenquishes every bound sender notification 
+ * using `notify_relenquish`and unregisters the callback */
+static void ffa_ref_notifications_cleanup(void *data)
+{
+	struct ffa_ref_notification_ctx *ctx = data;
+	const struct ffa_notifier_ops *notifier_ops;
+	unsigned long id;
+
+	if (!ctx || !ctx->ffa_dev || !ctx->ffa_dev->ops || !ctx->ffa_dev->ops->notifier_ops)
+		return;
+
+	notifier_ops = ctx->ffa_dev->ops->notifier_ops;
+	if (!notifier_ops->notify_relinquish)
+		return;
+
+	for_each_set_bit(id, ctx->registered, FFA_REF_MAX_NOTIFICATIONS) {
+		int ret;
+
+		ret = notifier_ops->notify_relinquish(ctx->ffa_dev, (int)id);
+		if (ret) {
+			dev_warn(&ctx->ffa_dev->dev,
+					"Failed to relenquish notificatin ID: %lu\n", id);
+		} else {
+			clear_bit(id, ctx->registered);
+			dev_info(&ctx->ffa_dev->dev,
+					"Relenquished application notification ID: %lu\n", id);
+		}
+	}
+}
+
+static int ffa_ref_notification_complete_test(struct ffa_device *ffa_dev)
+{
+	const struct ffa_notifier_ops *notifier_ops;
+	struct ffa_ref_notification_ctx *ctx;
+	int ret;
+
+	if (!ffa_dev->ops || !ffa_dev->ops->notifier_ops)
 		return -EOPNOTSUPP;
 
 	notifier_ops = ffa_dev->ops->notifier_ops;
 
-	ret = notifier_ops->notify_request(ffa_dev,
-			false, sp_notification_cb,
-			ffa_dev, NOTIF_SP_TO_LINUX_ID);
+	if (!notifier_ops->notify_send || !notifier_ops->notify_request || !notifier_ops->notify_relinquish)
+		return -EOPNOTSUPP;
 
+	ctx = devm_kzalloc(&ffa_dev->dev, sizeof(*ctx), GFP_KERNEL);
+	if (!ctx)
+		return -ENOMEM;
+
+	ctx->ffa_dev = ffa_dev;
+
+	init_waitqueue_head(&ctx->waitq);
+
+	for (unsigned int i = 0; i < FFA_REF_MAX_NOTIFICATIONS; i++)
+		atomic_set(&ctx->callback_count[i], 0);
+
+	ret = devm_add_action_or_reset(
+			&ffa_dev->dev, ffa_ref_notifications_cleanup, ctx);
 	if (ret)
 		return ret;
+
+	// Linux is the receiver for the IDs 20, 21, 22, 23
+	static const int callback_ids[] = {
+		NOTIF_SP_TO_LINUX_ID,
+		NOTIF_SP_TO_LINUX_MULTI_A_ID,
+		NOTIF_SP_TO_LINUX_MULTI_B_ID,
+		NOTIF_SP_REBIND_ACK_ID,
+	};
+
+	// binding SP as the sender for the above IDs
+	for (unsigned int i = 0; i < ARRAY_SIZE(callback_ids); i++) {
+		ret = ffa_ref_notification_register(ctx, notifier_ops, callback_ids[i]);
+		if (ret)
+			return ret;
+	}
+	dev_info(&ffa_dev->dev, "[NOTIF TEST]: Callback Registration complete\n");
+
+	/* Test 1: Linux sends ID 24 to the SP
+	 * This is an invalid notification as SP never bounded this to Linux,
+	 * hence this must be rejected */
+	ret = notifier_ops->notify_send(ffa_dev, NOTIF_LINUX_UNBOUND_ID, false, 0);
+	if (!ret) {
+		dev_err(&ffa_dev->dev,
+				"[NOTIF TEST]: unbound Linux -> SP ID 24 was unexpectedly accepted\n");
+		return -EPROTO;
+	}
+	dev_info(&ffa_dev->dev,
+			"[NOTIF TEST]: [PASS]: unbound Linux -> SP ID 24 was rejected(%d)\n", ret);
+	
+
+	/* Test 2: Linux sends ID 19 for the first time 
+	 *
+	 * in the testing sequence, SP after getting the first ID 19 signaled, it
+	 * - attempts UNBIND while ID 19 is pending 
+	 * - GETs ID 19
+	 * - GETs again to verify the bitmap has been cleared
+	 * - UNBINDs ID 19
+	 * - tests invalid SET parameters
+	 * - sends ID 20, 21, 22 to Linux as Multi notifs
+	 *
+	 *   So the final checking of this test, will be a mask of ID 20, 21, 22
+	 *   */
+	static const unsigned int response_ids[] = {
+		NOTIF_SP_TO_LINUX_ID,
+		NOTIF_SP_TO_LINUX_MULTI_A_ID,
+		NOTIF_SP_TO_LINUX_MULTI_B_ID,
+	};
+
+	ffa_ref_notifications_count_zero(ctx);
+
+	ret = notifier_ops->notify_send(ffa_dev, NOTIF_LINUX_TO_SP_ID, false, 0);
+	if (ret) {
+		dev_err(&ffa_dev->dev,
+				"[NOTIF TEST] sending ID 19 failed: %d\n", ret);
+		return ret;
+	}
+
+	// wait for all three SP -> Linux notification callbacks
+	ret = ffa_ref_wait_for_notifications(ctx, NOTIF_SP_RESPONSE_MASK);
+	if (ret) {
+		dev_err(&ffa_dev->dev, "[NOTIF TEST] timed out waiting for IDs 20, 21 and 22: %d\n", ret);
+		return ret;
+	}
+
+	ret = ffa_ref_verify_single_delivery(ctx, response_ids, ARRAY_SIZE(response_ids));
+	if (ret)
+		return ret;
+
+	dev_info(&ffa_dev->dev,
+			"[NOTIF TEST]: [PASS]: IDs 20,21,22 delivered once; repeated ID 20 SET also merged\n");
+
+
+	/* Test 3: Linux tries to send ID 19 again,
+	 * but the SP has unbound it already in last test */
+	ret = notifier_ops->notify_send(ffa_dev, NOTIF_LINUX_TO_SP_ID, false, 0);
+	if (!ret) {
+		dev_err(&ffa_dev->dev,
+				"[NOTIF TEST]: [FAIL]: ID 19 succeeded even after SP has unbound it; should have been rejected\n");
+		return -EPROTO;
+	}
+	dev_info(&ffa_dev->dev, "[NOTIF TEST]: [PASS]: Linux -> SP ID 19 rejected after UNBIND: %d\n", ret);
+
+	/* Test 4: Linux asks SP to bind ID 19 again
+	 * using the ID 25 which is the rebind signal */
+	ffa_ref_notifications_count_zero(ctx);
+
+	ret = notifier_ops->notify_send(ffa_dev, NOTIF_LINUX_REBIND_ID, false, 0);
+	if (ret) {
+		dev_err(&ffa_dev->dev, "[NOTIF TEST] sending rebind control ID 25 failed: %d\n", ret);
+		return ret;
+	}
+
+	ret = ffa_ref_wait_for_notifications(ctx, BIT_ULL(NOTIF_SP_REBIND_ACK_ID));
+	if (ret) {
+		dev_err(&ffa_dev->dev, "[NOTIF TEST] timed out waiting for ack ID 23: %d\n", ret);
+		return ret;
+	}
+
+	{
+		const unsigned int ack_id = NOTIF_SP_REBIND_ACK_ID;
+		ret = ffa_ref_verify_single_delivery(ctx, &ack_id, 1);
+	}
+	if (ret)
+		return ret;
+	dev_info(&ffa_dev->dev,
+			"[NOTIF TEST]: [PASS]: SP rebound ID 19 and acknowledged with ID 23\n");
+
+
+	/* Test 5: Checking that signaling via ID 19 works just like earlier
+	 * after it has been rebounded */
+	ffa_ref_notifications_count_zero(ctx);
+
+	ret = notifier_ops->notify_send(ffa_dev, NOTIF_LINUX_TO_SP_ID, false, 0);
+	if (ret) {
+		dev_err(&ffa_dev->dev, "[NOTIF TEST] ID 19 setting failed after SP rebind: %d\n", ret);
+		return ret;
+	}
+
+	ret = ffa_ref_wait_for_notifications(ctx, NOTIF_SP_RESPONSE_MASK);
+	if (ret) {
+		dev_err(&ffa_dev->dev, "[NOTIF TEST] timed out waiting for post-rebound IDs (%d)\n", ret);
+		return ret;
+	}
+
+	ret = ffa_ref_verify_single_delivery(ctx, response_ids, ARRAY_SIZE(response_ids));
+	if (ret)
+		return ret;
+
+	dev_info(&ffa_dev->dev,
+			"[NOTIF TEST]: [PASS]: ID 19 works after rebind, as IDs 20,21,22 were delivered once\n");
+
+
+	dev_info(&ffa_dev->dev, "Notification Lifecycle tests PASSED\n");
+
 	return 0;
 }
 
-int notify_sp_test(struct ffa_device *ffa_dev)
-{
-	dev_info(&ffa_dev->dev, "notify_sp_test called()\n");
-	int ret;
-
-	ret = ffa_dev->ops->notifier_ops->notify_send(ffa_dev, NOTIF_LINUX_TO_SP_ID, false, 0);
-	if (ret)
-		dev_err(&ffa_dev->dev, "Failed to notify SP \n");
-	return ret;
-	dev_info(&ffa_dev->dev, "SP was notified with ID: %d\n", NOTIF_LINUX_TO_SP_ID);
-}
 
 static int ffa_ref_client_probe(struct ffa_device *ffa_dev)
 {
+	const struct ffa_notifier_ops *notifier_ops;
 	int ret;
 
 	dev_info(&ffa_dev->dev, "FF-A reference client probed\n");
@@ -514,25 +803,50 @@ static int ffa_ref_client_probe(struct ffa_device *ffa_dev)
 		return -EOPNOTSUPP;
 	}
 
-	// BUG: notification test from here REMOVE THIS FROM HERE
-	ret = bind_ffa_notification_for_test(ffa_dev);
+	/* INFO: need to register the SRI i.e. the scheduler callback before the notification test */
+	notifier_ops = ffa_dev->ops->notifier_ops;
+
+	if (!notifier_ops->sched_recv_cb_register || 
+		!notifier_ops->sched_recv_cb_unregister ||
+		!ffa_dev->ops->cpu_ops ||
+		!ffa_dev->ops->cpu_ops->run) {
+
+		dev_err(&ffa_dev->dev, "Required scheduler operations unavailable\n");
+		return -EOPNOTSUPP;
+	}
+
+	ret = notifier_ops->sched_recv_cb_register(ffa_dev, ffa_ref_sched_recv_cb, ffa_dev);
 	if (ret) {
-		dev_err(&ffa_dev->dev, "Linux unable to bind the notification %d to the SP\n", NOTIF_SP_TO_LINUX_ID);
+		dev_err(&ffa_dev->dev, "Failed to register scheduler reciever callback: %d\n", ret);
+		return ret;
+	}
+	dev_info(&ffa_dev->dev, "Scheduler Receiver Callback registered for notification tests\n");
+
+	// BUG: notification test from here REMOVE THIS FROM HERE
+	dev_info(&ffa_dev->dev, "[TEST]: FF-A Notification Lifecycle Test\n");
+	ret = ffa_ref_notification_complete_test(ffa_dev);
+	
+	/* unregister Scheduler reciever callbacks whether notification test passed or failed,
+	 * as for later indirect msg test, it is re-registered again */
+	{
+		int unreg_ret;
+
+		unreg_ret = notifier_ops->sched_recv_cb_unregister(ffa_dev);
+		if (unreg_ret) {
+			dev_err(&ffa_dev->dev, "Failed to unregister the SRI callbacks: %d\n", ret);
+			
+			if (!ret)
+				ret = unreg_ret;
+		}
+	}
+
+	if (ret) {
+		dev_err(&ffa_dev->dev, "FF-A Notification Lifecycle tests FAILED: %d\n",ret);
 		return ret;
 	} else {
-		dev_info(&ffa_dev->dev,
-				"Linux bound Notification %d to the SP properly, now ringing the notification\n", NOTIF_SP_TO_LINUX_ID);
+		dev_info(&ffa_dev->dev,"[TEST]: FF-A Notification Lifecycle tests PASSED\n");
 	}
 	
-	/* ringing the notification to the SP */
-	dev_info(&ffa_dev->dev, "[TEST]: Notification Ringing\n");
-	ret = notify_sp_test(ffa_dev);
-	if (ret)
-		dev_err(&ffa_dev->dev, "Unable to ring Notification %d to the SP\n", NOTIF_LINUX_TO_SP_ID);
-	else 
-		dev_info(&ffa_dev->dev, "Notification %d ringed to SP properly\n", NOTIF_LINUX_TO_SP_ID);
-
-
 	dev_info(&ffa_dev->dev, "[TEST3]: Indirect Messaging\n");
 	ret = ffa_indirect_msg_test(ffa_dev);
 	if (ret == -ETIMEDOUT) {
